@@ -92,7 +92,7 @@ function storageGet(keys) {
    recognize "this change came from me, I'm already in sync" and skip
    the redundant re-render, while still re-rendering for changes that
    really did come from another tab. */
-const pendingLocalChanges = { todos: 0, notes: 0, links: 0 };
+const pendingLocalChanges = { todos: 0, notes: 0, links: 0, activeTabMode: 0 };
 
 function storageSet(key, value) {
   if (hasChromeStorage) {
@@ -434,6 +434,441 @@ linkModalSave.addEventListener('click', () => {
 });
 
 
+/* ---------------- TOP BROWSER TABS (100% REAL-TIME DYNAMIC) ---------------- */
+
+let activeTabMode = 'frequent'; // 'frequent' | 'recent' | 'open'
+let loadedTabs = [];
+
+function extractDomain(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.hostname.replace(/^www\./, '');
+  } catch (e) {
+    return rawUrl ? rawUrl.replace(/^https?:\/\/(www\.)?/, '').split('/')[0] : '';
+  }
+}
+
+function getFaviconUrl(url, explicitFavicon) {
+  if (explicitFavicon && (explicitFavicon.startsWith('http') || explicitFavicon.startsWith('data:'))) {
+    return explicitFavicon;
+  }
+  if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id) {
+    try {
+      const u = new URL(chrome.runtime.getURL('/_favicon/'));
+      u.searchParams.set('pageUrl', url);
+      u.searchParams.set('size', '32');
+      return u.toString();
+    } catch (e) {
+      // fallback
+    }
+  }
+  const domain = extractDomain(url);
+  return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32`;
+}
+
+/* 1. Frequently Opened: Combines Chrome Top Sites + Chrome History visit counts dynamically */
+function fetchFrequentlyOpened() {
+  return new Promise((resolve) => {
+    const resultsMap = new Map();
+
+    const fetchTopSites = new Promise((res) => {
+      if (typeof chrome !== 'undefined' && chrome.topSites && chrome.topSites.get) {
+        chrome.topSites.get((sites) => {
+          if (sites) {
+            sites.forEach(s => {
+              if (s.url && !s.url.startsWith('chrome://') && !s.url.startsWith('chrome-extension://')) {
+                resultsMap.set(s.url, {
+                  id: uid(),
+                  title: s.title || extractDomain(s.url),
+                  url: s.url,
+                  type: 'frequent'
+                });
+              }
+            });
+          }
+          res();
+        });
+      } else {
+        res();
+      }
+    });
+
+    const fetchHistoryByVisitCount = new Promise((res) => {
+      if (typeof chrome !== 'undefined' && chrome.history && chrome.history.search) {
+        const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+        chrome.history.search({ text: '', startTime: thirtyDaysAgo, maxResults: 300 }, (historyItems) => {
+          if (historyItems) {
+            const sorted = historyItems
+              .filter(h => h.url && !h.url.startsWith('chrome://') && !h.url.startsWith('chrome-extension://'))
+              .sort((a, b) => (b.visitCount || 0) - (a.visitCount || 0));
+
+            sorted.slice(0, 20).forEach(h => {
+              if (!resultsMap.has(h.url)) {
+                resultsMap.set(h.url, {
+                  id: uid(),
+                  title: h.title || extractDomain(h.url),
+                  url: h.url,
+                  visitCount: h.visitCount,
+                  type: 'frequent'
+                });
+              }
+            });
+          }
+          res();
+        });
+      } else {
+        res();
+      }
+    });
+
+    Promise.all([fetchTopSites, fetchHistoryByVisitCount]).then(() => {
+      resolve(Array.from(resultsMap.values()).slice(0, 16));
+    });
+  });
+}
+
+/* 2. Previously Opened: Combines recently closed tabs (sessions) + recent browsing history in real-time */
+function fetchPreviouslyOpened() {
+  return new Promise((resolve) => {
+    const list = [];
+    const seenUrls = new Set();
+
+    const fetchSessions = new Promise((res) => {
+      if (typeof chrome !== 'undefined' && chrome.sessions && chrome.sessions.getRecentlyClosed) {
+        chrome.sessions.getRecentlyClosed({ maxResults: 25 }, (sessions) => {
+          if (sessions) {
+            sessions.forEach(sess => {
+              if (sess.tab && sess.tab.url && !sess.tab.url.startsWith('chrome://') && !sess.tab.url.startsWith('chrome-extension://')) {
+                if (!seenUrls.has(sess.tab.url)) {
+                  seenUrls.add(sess.tab.url);
+                  list.push({
+                    id: uid(),
+                    sessionId: sess.tab.sessionId,
+                    title: sess.tab.title || extractDomain(sess.tab.url),
+                    url: sess.tab.url,
+                    favIconUrl: sess.tab.favIconUrl,
+                    type: 'recent'
+                  });
+                }
+              } else if (sess.window && sess.window.tabs) {
+                sess.window.tabs.forEach(t => {
+                  if (t.url && !t.url.startsWith('chrome://') && !t.url.startsWith('chrome-extension://') && !seenUrls.has(t.url)) {
+                    seenUrls.add(t.url);
+                    list.push({
+                      id: uid(),
+                      sessionId: t.sessionId,
+                      title: t.title || extractDomain(t.url),
+                      url: t.url,
+                      favIconUrl: t.favIconUrl,
+                      type: 'recent'
+                    });
+                  }
+                });
+              }
+            });
+          }
+          res();
+        });
+      } else {
+        res();
+      }
+    });
+
+    fetchSessions.then(() => {
+      if (typeof chrome !== 'undefined' && chrome.history && chrome.history.search) {
+        chrome.history.search({ text: '', maxResults: 30 }, (historyItems) => {
+          if (historyItems) {
+            historyItems.forEach(h => {
+              if (h.url && !h.url.startsWith('chrome://') && !h.url.startsWith('chrome-extension://') && !seenUrls.has(h.url)) {
+                seenUrls.add(h.url);
+                list.push({
+                  id: uid(),
+                  title: h.title || extractDomain(h.url),
+                  url: h.url,
+                  lastVisitTime: h.lastVisitTime,
+                  type: 'recent'
+                });
+              }
+            });
+          }
+          resolve(list.slice(0, 16));
+        });
+      } else {
+        resolve(list.slice(0, 16));
+      }
+    });
+  });
+}
+
+/* 3. Open Tabs: Queries live open browser tabs in real-time */
+function fetchOpenTabs() {
+  return new Promise((resolve) => {
+    if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query) {
+      chrome.tabs.query({ currentWindow: true }, (tabs) => {
+        if (tabs && tabs.length > 0) {
+          const list = tabs
+            .filter(t => t.url && !t.url.startsWith('chrome-extension://'))
+            .map(t => ({
+              id: uid(),
+              tabId: t.id,
+              windowId: t.windowId,
+              title: t.title || extractDomain(t.url),
+              url: t.url,
+              favIconUrl: t.favIconUrl,
+              active: t.active,
+              type: 'open'
+            }));
+          resolve(list);
+        } else {
+          resolve([]);
+        }
+      });
+    } else {
+      resolve([]);
+    }
+  });
+}
+
+function updateTabsScrollButtons() {
+  const track = document.getElementById('top-tabs-track');
+  const btnLeft = document.getElementById('tabs-scroll-left');
+  const btnRight = document.getElementById('tabs-scroll-right');
+  if (!track || !btnLeft || !btnRight) return;
+
+  const hasOverflow = track.scrollWidth > track.clientWidth + 4;
+  if (!hasOverflow) {
+    btnLeft.classList.remove('visible');
+    btnRight.classList.remove('visible');
+    return;
+  }
+
+  btnLeft.classList.add('visible');
+  btnRight.classList.add('visible');
+
+  btnLeft.classList.toggle('disabled', track.scrollLeft <= 2);
+  btnRight.classList.toggle('disabled', track.scrollLeft + track.clientWidth >= track.scrollWidth - 2);
+}
+
+function renderTopTabs(tabs) {
+  loadedTabs = tabs;
+  const track = document.getElementById('top-tabs-track');
+  if (!track) return;
+  track.innerHTML = '';
+
+  if (!tabs || tabs.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'tabs-empty-state';
+    if (typeof chrome === 'undefined' || !chrome.history) {
+      empty.textContent = '// load extension in chrome://extensions to sync live data';
+    } else if (activeTabMode === 'open') {
+      empty.textContent = '// no open tabs found';
+    } else if (activeTabMode === 'recent') {
+      empty.textContent = '// no recent history found';
+    } else {
+      empty.textContent = '// no frequently opened sites yet';
+    }
+    track.appendChild(empty);
+    updateTabsScrollButtons();
+    return;
+  }
+
+  tabs.forEach(tab => {
+    const item = document.createElement('a');
+    item.className = 'browser-tab' + (tab.active ? ' active-tab' : '');
+    item.href = tab.url;
+    item.title = `${tab.title}\n${tab.url}`;
+
+    // Favicon or Fallback letter badge
+    const domain = extractDomain(tab.url);
+    const initial = (domain || tab.title || '?')[0].toUpperCase();
+
+    const img = document.createElement('img');
+    img.className = 'tab-favicon';
+    img.alt = '';
+    img.loading = 'lazy';
+    img.src = getFaviconUrl(tab.url, tab.favIconUrl);
+
+    img.onerror = () => {
+      const fallback = document.createElement('span');
+      fallback.className = 'tab-fallback-icon';
+      fallback.textContent = initial;
+      if (item.contains(img)) {
+        item.replaceChild(fallback, img);
+      }
+    };
+
+    const titleEl = document.createElement('span');
+    titleEl.className = 'tab-title';
+    titleEl.textContent = tab.title;
+
+    const domainEl = document.createElement('span');
+    domainEl.className = 'tab-domain';
+    domainEl.textContent = domain;
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'tab-close';
+    closeBtn.textContent = '✕';
+    closeBtn.title = tab.type === 'open' ? 'close tab' : 'remove';
+
+    closeBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (tab.type === 'open' && tab.tabId && typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.remove) {
+        chrome.tabs.remove(tab.tabId, () => {
+          loadAndRenderTopTabs();
+        });
+      } else {
+        loadedTabs = loadedTabs.filter(t => t.id !== tab.id);
+        renderTopTabs(loadedTabs);
+      }
+    });
+
+    item.addEventListener('click', (e) => {
+      if (e.button === 1 || e.ctrlKey || e.metaKey) {
+        // middle click or command/ctrl click: open in background new tab
+        return;
+      }
+      e.preventDefault();
+
+      if (tab.type === 'open' && tab.tabId && typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.update) {
+        chrome.tabs.update(tab.tabId, { active: true });
+        if (tab.windowId && chrome.windows && chrome.windows.update) {
+          chrome.windows.update(tab.windowId, { focused: true });
+        }
+      } else if (tab.type === 'recent' && tab.sessionId && typeof chrome !== 'undefined' && chrome.sessions && chrome.sessions.restore) {
+        chrome.sessions.restore(tab.sessionId, () => {
+          loadAndRenderTopTabs();
+        });
+      } else {
+        window.location.href = tab.url;
+      }
+    });
+
+    item.append(img, titleEl, domainEl, closeBtn);
+    track.appendChild(item);
+  });
+
+  updateTabsScrollButtons();
+}
+
+function loadAndRenderTopTabs() {
+  let fetchPromise;
+  if (activeTabMode === 'recent') {
+    fetchPromise = fetchPreviouslyOpened();
+  } else if (activeTabMode === 'open') {
+    fetchPromise = fetchOpenTabs();
+  } else {
+    fetchPromise = fetchFrequentlyOpened();
+  }
+
+  return fetchPromise.then(tabs => {
+    renderTopTabs(tabs);
+  });
+}
+
+function setTopTabsMode(mode) {
+  activeTabMode = mode;
+  document.querySelectorAll('.top-mode-btn').forEach(btn => {
+    const isActive = btn.dataset.mode === mode;
+    btn.classList.toggle('active', isActive);
+    btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+  });
+  storageSet('activeTabMode', mode);
+  return loadAndRenderTopTabs();
+}
+
+function initTopNavTabs() {
+  const track = document.getElementById('top-tabs-track');
+  const btnLeft = document.getElementById('tabs-scroll-left');
+  const btnRight = document.getElementById('tabs-scroll-right');
+  const refreshBtn = document.getElementById('tabs-refresh-btn');
+
+  // Mode switcher clicks
+  document.querySelectorAll('.top-mode-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      setTopTabsMode(btn.dataset.mode);
+    });
+  });
+
+  // Horizontal wheel scroll on tabs strip
+  if (track) {
+    track.addEventListener('wheel', (e) => {
+      if (e.deltaY !== 0) {
+        e.preventDefault();
+        track.scrollLeft += e.deltaY;
+        updateTabsScrollButtons();
+      }
+    }, { passive: false });
+
+    track.addEventListener('scroll', updateTabsScrollButtons);
+  }
+
+  // Scroll buttons
+  if (btnLeft && track) {
+    btnLeft.addEventListener('click', () => {
+      track.scrollBy({ left: -220, behavior: 'smooth' });
+    });
+  }
+  if (btnRight && track) {
+    btnRight.addEventListener('click', () => {
+      track.scrollBy({ left: 220, behavior: 'smooth' });
+    });
+  }
+
+  window.addEventListener('resize', updateTabsScrollButtons);
+
+  // Refresh button
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', () => {
+      refreshBtn.classList.add('spin');
+      loadAndRenderTopTabs().then(() => {
+        setTimeout(() => refreshBtn.classList.remove('spin'), 600);
+      });
+    });
+  }
+
+  // Real-time live Chrome event listeners
+  if (typeof chrome !== 'undefined') {
+    // 1. Live tabs events
+    if (chrome.tabs) {
+      const handleTabsChange = () => {
+        if (activeTabMode === 'open') {
+          loadAndRenderTopTabs();
+        }
+      };
+      if (chrome.tabs.onCreated) chrome.tabs.onCreated.addListener(handleTabsChange);
+      if (chrome.tabs.onRemoved) chrome.tabs.onRemoved.addListener(handleTabsChange);
+      if (chrome.tabs.onActivated) chrome.tabs.onActivated.addListener(handleTabsChange);
+      if (chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+        if (changeInfo.title || changeInfo.url || changeInfo.favIconUrl) {
+          handleTabsChange();
+        }
+      });
+    }
+
+    // 2. Live history & sessions events
+    if (chrome.history) {
+      const handleHistoryChange = () => {
+        if (activeTabMode === 'recent' || activeTabMode === 'frequent') {
+          loadAndRenderTopTabs();
+        }
+      };
+      if (chrome.history.onVisited) chrome.history.onVisited.addListener(handleHistoryChange);
+      if (chrome.history.onVisitRemoved) chrome.history.onVisitRemoved.addListener(handleHistoryChange);
+    }
+
+    if (chrome.sessions && chrome.sessions.onChanged) {
+      chrome.sessions.onChanged.addListener(() => {
+        if (activeTabMode === 'recent') {
+          loadAndRenderTopTabs();
+        }
+      });
+    }
+  }
+}
+
+
 /* ---------------- INIT + LIVE CROSS-TAB SYNC ---------------- */
 
 const DEFAULT_LINKS = [
@@ -446,14 +881,17 @@ const DEFAULT_NOTES = [
   { id: uid(), text: "Life's beautiful, Jane", color: NOTE_COLORS[0] }
 ];
 
-storageGet({ todos: [], notes: DEFAULT_NOTES, links: DEFAULT_LINKS }).then(data => {
+storageGet({ todos: [], notes: DEFAULT_NOTES, links: DEFAULT_LINKS, activeTabMode: 'frequent' }).then(data => {
   todos = data.todos || [];
   notes = data.notes || [];
   links = data.links || [];
+  activeTabMode = data.activeTabMode || 'frequent';
   backfillNoteColors();
   renderTodos();
   renderNotes();
   renderLinks();
+  initTopNavTabs();
+  setTopTabsMode(activeTabMode);
 });
 
 if (hasChromeStorage) {
@@ -483,6 +921,13 @@ if (hasChromeStorage) {
       } else {
         links = changes.links.newValue || [];
         renderLinks();
+      }
+    }
+    if (changes.activeTabMode) {
+      if (pendingLocalChanges.activeTabMode > 0) {
+        pendingLocalChanges.activeTabMode--;
+      } else {
+        setTopTabsMode(changes.activeTabMode.newValue || 'frequent');
       }
     }
   });
