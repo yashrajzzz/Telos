@@ -1400,6 +1400,10 @@ html, body{
   margin-bottom: 22px;
 }
 
+.ml-2{
+  margin-left: 0.5rem;
+}
+
 .mt-16{
   margin-top: 4rem;
 }
@@ -1679,6 +1683,10 @@ html, body{
 
 .text-center{
   text-align: center;
+}
+
+.align-middle{
+  vertical-align: middle;
 }
 
 .font-mono{

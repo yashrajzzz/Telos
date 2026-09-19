@@ -1,14 +1,31 @@
 /* ---------------- CLOCK + DATE LINE ---------------- */
 
+let currentHourFormat = '24h';
+
 function pad(n) { return String(n).padStart(2, '0'); }
+
+function formatTimeParts(date) {
+  const hour24 = date.getHours();
+  if (currentHourFormat === '12h') {
+    const suffix = hour24 >= 12 ? 'PM' : 'AM';
+    const displayHour = hour24 % 12 || 12;
+    return {
+      time: `${pad(displayHour)}<span class="text-blue animate-blink">:</span>${pad(date.getMinutes())}<span class="text-blue animate-blink">:</span>${pad(date.getSeconds())}`,
+      suffix
+    };
+  }
+
+  return {
+    time: `${pad(hour24)}<span class="text-blue animate-blink">:</span>${pad(date.getMinutes())}<span class="text-blue animate-blink">:</span>${pad(date.getSeconds())}`,
+    suffix: ''
+  };
+}
 
 function updateClock() {
   const now = new Date();
-  const h = pad(now.getHours());
-  const m = pad(now.getMinutes());
-  const s = pad(now.getSeconds());
-  document.getElementById('clock-time').innerHTML =
-    `${h}<span class="text-blue animate-blink">:</span>${m}<span class="text-blue animate-blink">:</span>${s}`;
+  const { time, suffix } = formatTimeParts(now);
+  const suffixMarkup = currentHourFormat === '12h' ? `<span class="text-text-dim text-[20px] ml-2 align-middle">${suffix}</span>` : '';
+  document.getElementById('clock-time').innerHTML = `${time}${suffixMarkup}`;
 
   const days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
   const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
@@ -485,6 +502,7 @@ if (hasChromeStorage) {
         const tabInput = document.getElementById('tab-name-input');
         if (tabInput) tabInput.value = tabName;
         applyTabName(tabName);
+        applyHourFormat(s.hourFormat || DEFAULT_SETTINGS.hourFormat);
         applyPanelVisibility(s.panels || DEFAULT_SETTINGS.panels);
       }
     }
@@ -506,7 +524,7 @@ const THEMES = {
   ash:      { bg:'#000000', panel:'#141414', panel2:'#1c1c1c', line:'#2a2a2a', text:'#e8e8e8', textDim:'#888888', blue:'#bbbbbb', blue2:'#dddddd', red:'#cc6666' },
 };
 
-const DEFAULT_SETTINGS = { theme: 'ash', tabName: 'Telos', panels: { todo: true, shortcuts: true, notes: true } };
+const DEFAULT_SETTINGS = { theme: 'ash', tabName: 'Telos', hourFormat: '24h', panels: { todo: true, shortcuts: true, notes: true } };
 
 function applyTheme(name) {
   const t = THEMES[name] || THEMES.ash;
@@ -547,6 +565,12 @@ function applyTabName(name) {
   document.title = name || 'Telos';
 }
 
+function applyHourFormat(format) {
+  currentHourFormat = format === '12h' ? '12h' : '24h';
+  const select = document.getElementById('hour-format-select');
+  if (select) select.value = currentHourFormat;
+}
+
 // --- open / close ---
 const settingsBtn     = document.getElementById('settings-btn');
 const settingsOverlay = document.getElementById('settings-overlay');
@@ -574,9 +598,12 @@ document.addEventListener('keydown', e => {
 
 // --- panel toggles ---
 function saveSettings() {
+  currentHourFormat = document.getElementById('hour-format-select').value === '12h' ? '12h' : '24h';
+
   const s = {
     theme: currentTheme,
     tabName: document.getElementById('tab-name-input').value.trim() || 'Telos',
+    hourFormat: currentHourFormat,
     panels: {
       todo:      document.getElementById('toggle-todo').checked,
       shortcuts: document.getElementById('toggle-shortcuts').checked,
@@ -586,6 +613,7 @@ function saveSettings() {
   storageSet('settings', s);
   applyPanelVisibility(s.panels);
   applyTabName(s.tabName);
+  applyHourFormat(s.hourFormat);
 }
 
 ['toggle-todo', 'toggle-shortcuts', 'toggle-notes'].forEach(id => {
@@ -593,6 +621,7 @@ function saveSettings() {
 });
 
 document.getElementById('tab-name-input').addEventListener('input', saveSettings);
+document.getElementById('hour-format-select').addEventListener('change', saveSettings);
 
 // --- theme swatches ---
 let currentTheme = 'ash';
@@ -630,10 +659,11 @@ storageGet({ settings: DEFAULT_SETTINGS }).then(data => {
   const s = data.settings || DEFAULT_SETTINGS;
   currentTheme = s.theme || 'ash';
   applyTheme(currentTheme);
-  
+
   const tabName = s.tabName || 'Telos';
   document.getElementById('tab-name-input').value = tabName;
   applyTabName(tabName);
-  
+
+  applyHourFormat(s.hourFormat || DEFAULT_SETTINGS.hourFormat);
   applyPanelVisibility(s.panels || DEFAULT_SETTINGS.panels);
 });
